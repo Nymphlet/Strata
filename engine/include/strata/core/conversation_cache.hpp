@@ -290,6 +290,15 @@ inline constexpr size_t conversation_cache_swap_block_bytes(int mib) {
     return (size_t) mib << 20;
 }
 
+// how many leading tokens `a` and `b` have in common
+template<class A, class B>
+int64_t shared_prefix(const std::vector<A>& a, const std::vector<B>& b) {
+    const size_t n = std::min(a.size(), b.size());
+    size_t i = 0;
+    while (i < n && a[i] == b[i]) ++i;
+    return (int64_t) i;
+}
+
 class ConversationCache {
 public:
     struct Match {
@@ -371,6 +380,14 @@ public:
     bool can_fit(size_t incoming, size_t held = 0) const {
         return enabled() && held <= budget_ && incoming <= budget_ - held &&
                entries_.size() < slots_ && bytes() <= budget_ - held - incoming;
+    }
+
+    // the most leading tokens `prompt` has in common with a parked conversation, at a checkpoint or not (diagnostics)
+    template<class Token>
+    int64_t shared_tokens(const std::vector<Token>& prompt) const {
+        int64_t n = 0;
+        for (const auto& e : entries_) n = std::max(n, shared_prefix(e.live.ids, prompt));
+        return n;
     }
 
     template<class Token>
@@ -512,6 +529,9 @@ public:
             if (!entries_[i].pinned() && !(guarded_ != 0 && serials_[i] == guarded_)) n += entries_[i].bytes();
         return n;
     }
+
+    /// Where an evicted conversation goes instead of being dropped (the disk tier); it owns the image from then on.
+    void set_on_evict(std::function<void(SavedConversation&&)> fn) { on_evict_ = std::move(fn); }
 
     // #879: every parked conversation (pinned ones too) and the retained K/V go - after non-finite logits any of them
     // may carry the poison.  Returns how many were parked.
@@ -660,10 +680,12 @@ private:
         for (size_t i = 0; i < entries_.size(); ++i) {
             if (entries_[i].pinned() || (guarded_ != 0 && serials_[i] == guarded_)) continue;
             bytes_ -= entries_[i].bytes();
-            SavedConversation victim = sink_ ? std::move(entries_[i]) : SavedConversation{};
+            // the upstream evict sink wins over the disk tier's on_evict hook (only one is ever wired)
+            SavedConversation victim = (sink_ || on_evict_) ? std::move(entries_[i]) : SavedConversation{};
             erase(i);
             ++evictions_;
             if (sink_) sink_(std::move(victim));   // (its RAM is freed when the sink is done with it)
+            else if (on_evict_) on_evict_(std::move(victim));   // e.g. the disk tier (conversation_disk.hpp); else dropped here
             return true;
         }
         return false;
@@ -678,6 +700,7 @@ private:
     std::deque<uint64_t> serials_;          // entries_[i]'s identity, never reused
     uint64_t next_serial_ = 1, guarded_ = 0;
     bool guard_blocked_ = false;
+    std::function<void(SavedConversation&&)> on_evict_;
     ConversationKvReuse reuse_;
     SegmentPoolBudget* pool_ = nullptr;   // STRATA_PARK_SEGPOOL_MIB (not owned)
     std::function<void(SavedConversation&&)> sink_;   // P2: where an evicted conversation goes (set_evict_sink)

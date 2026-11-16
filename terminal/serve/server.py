@@ -613,8 +613,9 @@ class ConvCacheLog:
         r"strata serve: after non-finite logits \(#879\): (?:the restored session replaces the live one; dropped \d+ parked "
         r"conversations?|dropped the live session, \d+ checkpoints?, \d+ parked conversations? and \d+ idle slots? "
         r"\(\d+ running slots? not kept after their reply\); reading this prompt from token 0)$")
-    EVENT = re.compile(r"conversation cache: (parked|skipped|restored) (\d+) tokens.*?parked=(\d+) bytes=(\d+)"
-                       r"(?: evictions=(\d+))?")
+    EVENT = re.compile(r"conversation cache: (parked|skipped|restored|sent to the disk) (\d+) tokens.*?parked=(\d+) "
+                       r"bytes=(\d+)(?: evictions=(\d+))?")
+    ON_DISK = re.compile(r"conversation disk: .*?on disk (\d+), (\d+) MiB")   # the disk tier (--conversation-disk-dir)
     DROPPED = re.compile(r"conversation cache: dropped \d+ superseded .*?parked=(\d+)")
     # #6081: a park the cache refused, by reason (the engine's "skip parking (...)" / "allocation failed" lines; a
     # "skipped N tokens" line is put()'s refusal).  The first match names the reason; any other text is the size
@@ -632,7 +633,8 @@ class ConvCacheLog:
 
     def reset(self):
         self.state = {"parked": 0, "bytes": 0, "evictions": 0, "parks": 0, "restores": 0, "last_event": None,
-                      "last_tokens": None, "last_at": None, "refused": {}, "refused_total": 0, "last_refused": None}
+                      "last_tokens": None, "last_at": None, "refused": {}, "refused_total": 0, "last_refused": None,
+                      "on_disk": None, "disk_mib": None, "disk_hits": 0}
 
     def poll(self, path, start) -> dict:
         """The state after the log's new lines; `start` is where the engine's current run began in it.  One poll at a
@@ -669,6 +671,12 @@ class ConvCacheLog:
         self.pos += end
         now = time.time()
         for line in data[:end].decode("utf-8", "replace").splitlines():
+            if "conversation disk:" in line:
+                m = self.ON_DISK.search(line)
+                if m:
+                    self.state["on_disk"], self.state["disk_mib"] = int(m.group(1)), int(m.group(2))
+                self.state["disk_hits"] += "disk hit:" in line
+                continue
             if "conversation cache:" not in line:
                 if self.CLEARED.fullmatch(line):
                     self.state["parked"] = self.state["bytes"] = 0
@@ -680,7 +688,7 @@ class ConvCacheLog:
                 if m.group(5) is not None:
                     st["evictions"] = int(m.group(5))
                 if m.group(1) != "skipped":
-                    st["parks" if m.group(1) == "parked" else "restores"] += 1
+                    st["restores" if m.group(1) == "restored" else "parks"] += 1
                     st["last_event"], st["last_tokens"], st["last_at"] = m.group(1), int(m.group(2)), now
                 else:
                     self._refused("put")
@@ -820,6 +828,9 @@ class StrataEngine:
             pin["preexec_fn"] = lambda: (say_nice() if say_nice else None, os.nice(nice))[0]
             print(f"[strata] engine priority: nice +{nice} (this PC has built-in Radeon graphics that usually draw the desktop; "
                   "STRATA_ENGINE_NICE=0 turns it off)", flush=True)
+        # --conversation-disk-persist on|exit-only: at QUIT the engine first writes its conversations to the disk (GBs)
+        persist = args[args.index("--conversation-disk-persist") + 1] if "--conversation-disk-persist" in args else "off"
+        self.quit_s = ENGINE_QUIT_WAIT_S if persist == "off" else 300
         end_leftover_engines(exe)                        # one an earlier run lost still holds the GPU and the memory
         oomd_pacer.make_room(args)                       # Linux desktop: the file cache an earlier start left is dropped first, so the engine's RAM is free (serve/oomd_pacer.py)
         spawned_at = time.monotonic()
@@ -2892,7 +2903,7 @@ class StrataEngine:
                     self.proc.stdin.write("STOP\nQUIT\n")
                     self.proc.stdin.flush()
                     self.proc.stdin.close()  # Windows' detached stdin reader must see EOF before shutdown
-                    self.proc.wait(timeout=ENGINE_QUIT_WAIT_S)
+                    self.proc.wait(timeout=getattr(self, "quit_s", ENGINE_QUIT_WAIT_S))
                 except (OSError, ValueError, subprocess.TimeoutExpired):
                     self.proc.terminate()
                     self.proc.wait(timeout=ENGINE_TERM_WAIT_S)
